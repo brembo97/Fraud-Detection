@@ -1,0 +1,485 @@
+---
+title: "Predictive Models for Fraud Detection"
+date: "`r Sys.Date()`"
+author: Emilio Brenes
+output:
+  rmdformats::readthedown:
+    highlight: kate
+---
+
+
+```{r setup, echo=TRUE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+```{r}
+wd <- getwd()
+setwd(wd)
+
+library(ggplot2)
+library(ggpubr)
+library(stats)
+library(cluster)
+library(mclust)
+library(factoextra)
+library(dendextend)
+library(DT)
+library(tidyverse)
+library(dplyr)
+library(purrr)
+library(tidygraph)
+library(ROCR)
+library(e1071)
+library(randomForest)
+library(rpart)
+library(caret)
+library(reshape2)
+library(plotly)
+library(AppliedPredictiveModeling)
+library(caTools)
+library(imputeTS)
+library(nnet)
+library(recipes)
+library(kernlab)
+library(ranger)
+library(gbm)
+library(randomForest)
+library(doParallel)
+library(modelgrid)
+library(klaR)
+```
+
+# Data Wrangling
+
+```{r}
+datos <- read_csv("../datos.fraude.train.csv")
+datos <- datos[,-1]
+attach(datos)
+summary(datos)
+```
+
+
+```{r}
+datos$Class <- if_else(datos$Class == 1, "Si", "No")
+datos$Class <- as.factor(datos$Class)
+
+any(!complete.cases(datos))
+```
+
+```{r}
+ggplot(data = datos, aes(x = Class, y = stat(count),fill = Class))+
+  geom_bar()+scale_fill_manual(values = c("gray50", "orangered2"))+
+  labs(title = "Casos de Fraude")+
+  theme_bw()+
+  theme(legend.position = "bottom")
+```
+
+```{r}
+df <- as.data.frame(table(datos$Class))
+df$Porcentaje <- df$Freq/sum(df$Freq)
+DT::datatable(df) %>% formatPercentage("Porcentaje", 3)
+```
+
+
+# Data Balancing and Partitioning
+
+```{r}
+# Downsample to balance data and aleviate computational capacity
+x <- datos[,!(names(datos) %in% "Class")]
+y <- datos$Class
+datos <- downSample(x = x, y = y, list = FALSE)
+
+df <- as.data.frame(table(datos$Class))
+df$Porcentaje <- df$Freq/sum(df$Freq)
+DT::datatable(df) %>% formatPercentage("Porcentaje", 3)
+```
+
+```{r}
+train <- createDataPartition(datos$Class, times = 1, p = 0.8, list = FALSE)
+data.train <- datos[train,]
+data.test <- datos[-train,]
+```
+
+
+```{r}
+pro.train <- as.data.frame(table(data.train$Class))
+pro.test <- as.data.frame(table(data.test$Class))
+colnames(pro.train) <- c("Class","F.Train")
+
+pro.train$F.test <- pro.test$Freq
+
+pro.train$P.train <- pro.train$F.Train/sum(pro.train$F.Train)
+pro.test$P.test <- pro.train$F.test/sum(pro.train$F.test)
+
+DT::datatable(pro.train)
+```
+
+
+# Data Preprocessing
+
+```{r}
+objeto.recipe <- recipe(formula = Class ~., data = datos)
+objeto.recipe
+```
+
+
+```{r}
+tmp <- datos %>% nearZeroVar(saveMetrics = TRUE)
+DT::datatable(tmp)%>%formatPercentage("percentUnique",2)%>%formatRound("freqRatio",2)
+```
+
+```{r}
+objeto.recipe <- objeto.recipe%>% step_nzv(all_predictors())
+
+objeto.recipe <- objeto.recipe%>% step_center(all_numeric())
+objeto.recipe <- objeto.recipe%>% step_scale(all_numeric())
+
+trained.recipe <- prep(objeto.recipe, training = data.train)
+trained.recipe
+```
+
+```{r}
+data.train.prep <- bake(trained.recipe, new_data = data.train)
+data.test.prep <- bake(trained.recipe, new_data = data.test)
+
+glimpse(data.train.prep)
+```
+
+
+# Variable Selection
+
+```{r}
+workers<-makeCluster(4)
+registerDoParallel(workers)
+
+# Size of predictor sets
+subsets <- c(4:30)
+
+# Size of resamples for bootstraping
+repeticiones <- 10
+
+# Seeds
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones + 1)
+for (i in 1:repeticiones) {
+  seeds[[i]] <- sample.int(1000, length(subsets))
+} 
+seeds[[repeticiones + 1]] <- sample.int(1000, 1)
+
+# Training control
+ctrl_rfe <- rfeControl(functions = rfFuncs, method = "boot", number = repeticiones,
+                       returnResamp = "all", allowParallel = TRUE, verbose = FALSE,
+                       seeds = seeds)
+
+# Recursive elemination process of predictors
+set.seed(342)
+rf.rfe <- rfe(Class ~ ., data = data.train.prep,
+              sizes = subsets,
+              metric = "Accuracy",
+              # Accuracy is the ratio of correct classifications
+              rfeControl = ctrl_rfe,
+              ntree = 250)
+
+rf.rfe
+```
+
+
+After 8 variables, the mariginal increment in accuracy is minimal and the Kappa starts to diminish. Therefore, this will be the size of the predictor set.
+
+
+```{r}
+rf.rfe$results %>%
+  group_by(Variables)%>%
+  summarise(
+    mean.acc = mean(Accuracy),
+    mean.kappa = mean(Kappa)
+  )%>%
+  arrange(desc(mean.kappa))
+```
+
+
+```{r}
+ggplot(data = rf.rfe$results, aes(x = Variables, y = Accuracy)) +
+  geom_line() +
+  scale_x_continuous(breaks  = unique(rf.rfe$results$Variables)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = Accuracy - AccuracySD, ymax = Accuracy + AccuracySD),
+                width = 0.2) +
+  geom_point(data = rf.rfe$results %>% slice(which.max(Accuracy)),
+             color = "red") +
+  theme_bw()
+```
+
+
+```{r}
+top8var <- rf.rfe$variables %>%
+  filter(Variables == 8)%>%
+  group_by(var)%>%
+  summarise(
+    mean = mean(Overall),
+    sd = mean(Overall)
+  )%>%
+  arrange(desc(mean))
+
+top.var <- top8var$var[1:8]
+top.var
+```
+
+```{r}
+rf.rfe$optVariables
+```
+
+
+# Model Training
+
+```{r}
+grid.modelos <- model_grid()
+grid.modelos
+```
+
+
+```{r}
+grid.modelos <- grid.modelos %>% 
+  share_settings(
+    y = data.train.prep$Class,
+    x = data.train.prep %>% dplyr::select(top.var),
+    metric = "Accuracy",
+    trControl = trainControl(method = "repeatedcv",
+                             number = 10,
+                             repeats = 5,
+                             returnResamp = "final",
+                             verboseIter = FALSE,
+                             allowParallel = TRUE
+                             )
+  )
+
+grid.modelos <- grid.modelos %>%
+  add_model(
+    model_name = "RandomForest",
+    method = "rf",
+    num.trees  = 300,
+    tuneGrid   = expand.grid(mtry = c(2,3,5))
+  ) %>%
+  add_model(
+    model_name = "RegLogistica",
+    method = "glm",
+    family = binomial(link = "logit")
+  ) %>%
+  add_model(
+    model_name = "SVM",
+    method = "svmRadial",
+    tuneGrid   = expand.grid(sigma = c(0.001, 0.01, 0.1, 0.5, 1),
+                              C = c(1 , 20, 50, 100)
+                             )
+  )
+
+```
+
+
+```{r}
+workers <- makeCluster(4)
+registerDoParallel(workers)
+
+grid.modelos <- train(grid.modelos, train_all = FALSE, resample_seed = 123)
+grid.modelos$model_fits
+```
+
+
+```{r}
+grid.modelos <- grid.modelos %>%
+  add_model(
+    model_name = "NaiveBayes",
+    method = "nb"
+  )%>%
+  add_model(
+    model_name = "KNN",
+    method = "knn",
+    tuneGrid = expand.grid(
+      k = c(1, 2, 5, 10, 15, 20)
+    )
+  )%>% 
+  add_model(
+    model_name = "NeuralNets",
+    method = "nnet",
+    rang = c(-0.7, 0.7),
+    trace = FALSE,
+    tuneGrid = expand.grid(
+      size = c(10, 20, 50),
+      decay = c(0.0001, 0.1, 0.5)
+    )
+  )%>%
+  add_model(
+    model_name = "LDA",
+    method = "lda"
+  )
+
+workers <- makeCluster(4)
+registerDoParallel(workers)
+
+grid.modelos <- train(grid.modelos, train_all = FALSE, resample_seed = 123)
+grid.modelos$model_fits
+```
+
+# Model Error Evaluation
+
+```{r}
+metricas.cv <- as.data.frame(caret::resamples(x = grid.modelos$model_fits))%>%
+  gather(key = "modelo", value = "valor",-Resample)
+
+DT::datatable(metricas.cv %>% group_by(modelo) %>%
+                summarise(Media_Precision = round(mean(valor),3) ) %>%
+                arrange(desc(Media_Precision))
+              )
+```
+
+```{r}
+metricas.cv %>%
+  group_by(modelo) %>% 
+  summarise(media = mean(valor)) %>%
+  ggplot(aes(x = reorder(modelo, media), y = media, label = round(media, 3))) +
+    geom_segment(aes(x = reorder(modelo, media), y = 0,
+                     xend = modelo, yend = media),
+                     color = "grey50") +
+    geom_point(size = 7, color = "firebrick") +
+    geom_text(color = "white", size = 2.5) +
+    scale_y_continuous(limits = c(0, 1)) +
+    # Accuracy basal
+    geom_hline(yintercept = 0.55, linetype = "dashed") +
+    annotate(geom = "text", y = 0.72, x = 8.5, label = "Accuracy basal") +
+    labs(title = "Validación: Accuracy medio repeated-CV",
+         subtitle = "Modelos ordenados por media",
+         x = "modelo") +
+    coord_flip() +
+    theme_bw()
+```
+
+```{r}
+predicciones <- extractPrediction(models = grid.modelos$model_fits,
+                          testX = data.test.prep %>% dplyr::select(top.var),
+                          testY = data.test.prep$Class
+                          )
+DT::datatable(predicciones)
+```
+
+
+```{r}
+metricas.predicciones <- predicciones %>%
+                mutate(acierto = if_else(obs == pred,TRUE,FALSE))%>%
+                group_by(model,dataType)%>%
+                summarise(
+                  accuracy = mean(acierto)
+                )%>%
+                arrange(desc(accuracy))
+DT::datatable(metricas.predicciones)
+```
+
+```{r}
+ggplot(data = metricas.predicciones,
+       aes(x = reorder(model, accuracy), y = accuracy,
+           color = dataType, label = round(accuracy, 2))) +
+  geom_point(size = 8) +
+  scale_color_manual(values = c("orangered2", "gray50")) +
+  geom_text(color = "white", size = 3) +
+  scale_y_continuous(limits = c(0, 1)) +
+  # Accuracy basal
+  geom_hline(yintercept = 0.55, linetype = "dashed") +
+  annotate(geom = "text", y = 0.56, x = 8.5, label = "Accuracy basal") +
+  coord_flip() +
+  labs(title = "Accuracy de entrenamiento y test", 
+       x = "modelo") +
+  theme_bw() + 
+  theme(legend.position = "bottom")
+```
+
+Although SVM and LogisticRegressoin produced the same accuracy on the test dataset, I opted for LR as the winner because it had less variation with the results of the training set. 
+
+# Winner Model
+
+```{r}
+data.bake <- bake(trained.recipe, new_data = datos)
+
+glm.modelo <- model_grid()
+glm.modelo <- glm.modelo %>%
+  share_settings(
+    x = data.bake %>% dplyr::select(top.var),
+    y = data.bake$Class,
+    metric = "Accuracy",
+    trControl = trainControl(
+      method = "repeatedcv",
+      number = 10,
+      repeats = 5,
+      returnResamp = "final",
+      verboseIter = FALSE,
+      allowParallel = TRUE
+    )
+  )
+glm.modelo <- glm.modelo %>%
+  add_model(
+    model_name = "RegLogistica",
+    method = "glm",
+    family = binomial(link = "logit")
+  )
+
+workers <- makeCluster(4)
+registerDoParallel(workers)
+
+glm.modelo <- train(glm.modelo, train_all = FALSE, resample_seed = 123)
+glm.modelo$model_fits
+```
+
+
+```{r}
+testdata <- read_csv("../datos.fraude.test.csv")
+id <- testdata$X1
+testdata <- testdata[,-1]
+testdata <- bake(trained.recipe, testdata)
+
+predicciones.glm <- extractPrediction(
+                    models = glm.modelo$model_fits,
+                    unkX = testdata
+                    )
+predicciones.glm
+```
+
+
+```{r}
+predicciones.fraude <- as.data.frame(cbind(id, predicciones.glm$pred))
+colnames(predicciones.fraude) <- c("Id","Prediccion")
+predicciones.fraude[,2] <- if_else(predicciones.fraude[,2] == "1","No","Si")
+
+# write.csv(predicciones.fraude,
+#           "C:\\Users\\pcEmilio\\Desktop\\Lead\\2020 Q1\\Mineria Avanzada\\Examen Final\\Fraud\\Predictions.csv", row.names = FALSE)
+```
+
+```{r}
+saveRDS(glm.modelo$model_fits, "./winnerModel.rds")
+
+# load the model
+clasificadorGanador <- readRDS("./winnerModel.rds")
+print(clasificadorGanador)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
